@@ -35,12 +35,12 @@ func (b *bucket[T]) get(key string) *Item[T] {
 	return b.lookup[key]
 }
 
-func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) *Item[T] {
+func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) (*Item[T], bool) {
 	b.RLock()
 	item := b.lookup[key]
 	b.RUnlock()
 	if item != nil {
-		return item
+		return item, false
 	}
 
 	expires := time.Now().Add(duration).UnixNano()
@@ -52,11 +52,11 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 	// check again under write lock
 	item = b.lookup[key]
 	if item != nil {
-		return item
+		return item, false
 	}
 
 	b.lookup[key] = newItem
-	return newItem
+	return newItem, true
 }
 
 func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track bool) (*Item[T], bool) {

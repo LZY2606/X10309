@@ -17,6 +17,7 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	events          *eventPipe
 }
 
 // Create a new cache with the specified configuration
@@ -37,6 +38,7 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 			lookup: make(map[string]*Item[T]),
 		}
 	}
+	c.events = newEventPipe(config.eventSink, config.eventBuffer)
 	go c.worker()
 	return c
 }
@@ -88,6 +90,8 @@ func (c *Cache[T]) Get(key string) *Item[T] {
 		case c.promotables <- item:
 		default:
 		}
+	} else if c.events != nil && item.claimTerminal(EventExpiration) {
+		c.emitEvent(EventExpiration, item)
 	}
 	return item
 }
@@ -123,7 +127,10 @@ func (c *Cache[T]) Set(key string, value T, duration time.Duration) {
 
 // Setnx set the value in the cache for the specified duration if not exists
 func (c *Cache[T]) Setnx(key string, value T, duration time.Duration) {
-	c.bucket(key).setnx(key, value, duration, false)
+	item, created := c.bucket(key).setnx(key, value, duration, false)
+	if created {
+		c.emitEvent(EventSet, item)
+	}
 }
 
 // Setnx2 set the value in the cache for the specified duration if not exists
@@ -137,6 +144,7 @@ func (c *Cache[T]) Setnx2(key string, f func() T, duration time.Duration) *Item[
 		}
 		// consistent with set
 	} else if !existing {
+		c.emitEvent(EventSet, item)
 		c.promotables <- item
 	}
 	return item
@@ -194,13 +202,49 @@ func (c *Cache[T]) Delete(key string) bool {
 	return false
 }
 
+// SyncEvents waits until the EventSink has received every event produced by
+// operations of the calling goroutine up to this point. It is the barrier to
+// use (possibly together with SyncUpdates) before inspecting a recorded event
+// stream. It is a no-op when no EventSink is configured.
+func (c *Cache[T]) SyncEvents() {
+	if c.events != nil {
+		c.events.sync()
+	}
+}
+
+// DroppedEvents returns the number of events that were discarded because the
+// EventSink was too slow to drain its bounded buffer, since the cache started.
+// It returns 0 when no EventSink is configured.
+func (c *Cache[T]) DroppedEvents() int64 {
+	if c.events == nil {
+		return 0
+	}
+	return c.events.droppedCount()
+}
+
 func (c *Cache[T]) set(key string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(key).set(key, value, duration, track)
+	if existing != nil && existing.claimTerminal(EventReplace) {
+		c.emitEvent(EventReplace, existing)
+	}
+	c.emitEvent(EventSet, item)
 	if existing != nil {
 		c.deletables <- existing
 	}
 	c.promotables <- item
 	return item
+}
+
+func (c *Cache[T]) emitEvent(kind EventKind, item *Item[T]) {
+	if c.events == nil {
+		return
+	}
+	c.events.emit(Event{
+		Kind:       kind,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.generation,
+	})
 }
 
 func (c *Cache[T]) bucket(key string) *bucket[T] {
@@ -294,6 +338,9 @@ drain:
 		case item := <-c.deletables:
 			c.doDelete(item)
 		default:
+			if c.events != nil {
+				c.events.close()
+			}
 			return
 		}
 	}
@@ -331,6 +378,9 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
+	if item.claimTerminal(EventDelete) {
+		c.emitEvent(EventDelete, item)
+	}
 	if !item.inList {
 		item.promotions = -2
 	} else {
@@ -353,12 +403,18 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
+			if !item.isTerminal() {
+				c.emitEvent(EventPromotion, item)
+			}
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	if !item.isTerminal() {
+		c.emitEvent(EventPromotion, item)
+	}
 	return true
 }
 
@@ -386,6 +442,9 @@ func (c *Cache[T]) gc() int {
 			}
 			dropped += 1
 			item.promotions = -2
+			if item.claimTerminal(EventEviction) {
+				c.emitEvent(EventEviction, item)
+			}
 		}
 		item = prev
 	}

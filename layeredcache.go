@@ -17,6 +17,7 @@ type LayeredCache[T any] struct {
 	pruneTargetSize int64
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	events          *eventPipe
 }
 
 // Create a new layered cache with the specified configuration.
@@ -48,6 +49,7 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 			buckets: make(map[string]*bucket[T]),
 		}
 	}
+	c.events = newEventPipe(config.eventSink, config.eventBuffer)
 	go c.worker()
 	return c
 }
@@ -74,6 +76,8 @@ func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
 		case c.promotables <- item:
 		default:
 		}
+	} else if c.events != nil && item.claimTerminal(EventExpiration) {
+		c.emitEvent(EventExpiration, item)
 	}
 	return item
 }
@@ -185,11 +189,46 @@ func (c *LayeredCache[T]) DeleteFunc(primary string, matches func(key string, it
 
 func (c *LayeredCache[T]) set(primary, secondary string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track)
+	if existing != nil && existing.claimTerminal(EventReplace) {
+		c.emitEvent(EventReplace, existing)
+	}
+	c.emitEvent(EventSet, item)
 	if existing != nil {
 		c.deletables <- existing
 	}
 	c.promote(item)
 	return item
+}
+
+// SyncEvents waits until the EventSink has received every event produced by
+// operations of the calling goroutine up to this point. It is a no-op when no
+// EventSink is configured.
+func (c *LayeredCache[T]) SyncEvents() {
+	if c.events != nil {
+		c.events.sync()
+	}
+}
+
+// DroppedEvents returns the number of events discarded because the EventSink
+// was too slow to drain its bounded buffer. It returns 0 without an
+// EventSink.
+func (c *LayeredCache[T]) DroppedEvents() int64 {
+	if c.events == nil {
+		return 0
+	}
+	return c.events.droppedCount()
+}
+
+func (c *LayeredCache[T]) emitEvent(kind EventKind, item *Item[T]) {
+	if c.events == nil {
+		return
+	}
+	c.events.emit(Event{
+		Kind:       kind,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.generation,
+	})
 }
 
 func (c *LayeredCache[T]) bucket(key string) *layeredBucket[T] {
@@ -287,12 +326,18 @@ drain:
 		case item := <-c.deletables:
 			c.doDelete(item)
 		default:
+			if c.events != nil {
+				c.events.close()
+			}
 			return
 		}
 	}
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
+	if item.claimTerminal(EventDelete) {
+		c.emitEvent(EventDelete, item)
+	}
 	if !item.inList {
 		item.promotions = -2
 	} else {
@@ -315,12 +360,18 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
+			if !item.isTerminal() {
+				c.emitEvent(EventPromotion, item)
+			}
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	if !item.isTerminal() {
+		c.emitEvent(EventPromotion, item)
+	}
 	return true
 }
 
@@ -349,6 +400,9 @@ func (c *LayeredCache[T]) gc() int {
 			}
 			dropped += 1
 			item.promotions = -2
+			if item.claimTerminal(EventEviction) {
+				c.emitEvent(EventEviction, item)
+			}
 		}
 		item = prev
 	}

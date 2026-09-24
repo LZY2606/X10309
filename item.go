@@ -19,6 +19,12 @@ type TrackedItem[T any] interface {
 	Extend(duration time.Duration)
 }
 
+// itemGenerationCounter hands out unique, monotonically increasing item
+// generations. A global counter is used so that items never need a back
+// reference to their cache; for any given key the generations still arrive in
+// strictly increasing order, which is all an EventSink relies on.
+var itemGenerationCounter uint64
+
 type Item[T any] struct {
 	key        string
 	group      string
@@ -27,9 +33,14 @@ type Item[T any] struct {
 	expires    int64
 	size       int64
 	value      T
-	next       *Item[T]
-	prev       *Item[T]
-	inList     bool
+	generation uint64
+	// terminal holds the EventKind that terminated the item generation, or 0
+	// while the item is live. It is claimed with compare-and-swap so that an
+	// item generation produces at most one terminal event.
+	terminal int32
+	next     *Item[T]
+	prev     *Item[T]
+	inList   bool
 }
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
@@ -46,6 +57,7 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		generation: atomic.AddUint64(&itemGenerationCounter, 1),
 	}
 	if track {
 		item.refCount = 1
@@ -64,6 +76,13 @@ func (i *Item[T]) Key() string {
 
 func (i *Item[T]) Value() T {
 	return i.value
+}
+
+// Generation returns the unique, monotonically increasing number assigned to
+// this particular incarnation of the key. Each overwrite starts a new
+// generation; it matches the Generation field of the item's events.
+func (i *Item[T]) Generation() uint64 {
+	return i.generation
 }
 
 func (i *Item[T]) track() {
@@ -91,6 +110,17 @@ func (i *Item[T]) Expires() time.Time {
 
 func (i *Item[T]) Extend(duration time.Duration) {
 	atomic.StoreInt64(&i.expires, time.Now().Add(duration).UnixNano())
+}
+
+// claimTerminal reports whether the caller is the first to terminate the item
+// generation with the given event kind. Only a winning claim produces a
+// terminal event.
+func (i *Item[T]) claimTerminal(kind EventKind) bool {
+	return atomic.CompareAndSwapInt32(&i.terminal, 0, int32(kind))
+}
+
+func (i *Item[T]) isTerminal() bool {
+	return atomic.LoadInt32(&i.terminal) != 0
 }
 
 // String returns a string representation of the Item. This includes the default string

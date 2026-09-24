@@ -17,6 +17,10 @@ func (s *SecondaryCache[T]) Get(secondary string) *Item[T] {
 // The semantics are the same as for LayeredCache.Set
 func (s *SecondaryCache[T]) Set(secondary string, value T, duration time.Duration) *Item[T] {
 	item, existing := s.bucket.set(secondary, value, duration, false)
+	if existing != nil && existing.claimTerminal(EventReplace) {
+		s.pCache.emitEvent(EventReplace, existing)
+	}
+	s.pCache.emitEvent(EventSet, item)
 	if existing != nil {
 		s.pCache.deletables <- existing
 	}

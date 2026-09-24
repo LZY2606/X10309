@@ -9,6 +9,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	eventSink      EventSink
+	eventBuffer    int
 }
 
 // Creates a configuration object with sensible defaults
@@ -62,7 +64,7 @@ func (c *Configuration[T]) PromoteBuffer(size uint32) *Configuration[T] {
 	return c
 }
 
-// The size of the queue for items which should be deleted. If the queue fills
+// The size of the queue for items which are deleted. If the queue fills
 // up, calls to Delete() will block
 func (c *Configuration[T]) DeleteBuffer(size uint32) *Configuration[T] {
 	c.deleteBuffer = int(size)
@@ -86,7 +88,7 @@ func (c *Configuration[T]) GetsPerPromote(count int32) *Configuration[T] {
 // time, things get messy. Specifically, the cache can evict the item, while
 // references still exist. Technically, this isn't an issue. However, if you reload
 // the item back into the cache, you end up with 2 objects representing the same
-// data. This is a waste of space and could lead to weird behavior (the type an
+// data. This is a waste of space and it could lead to weird behavior (the type an
 // identity map is meant to solve).
 
 // By turning tracking on and using the cache's TrackingGet, the cache
@@ -102,5 +104,30 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// EventSink enables an opt-in lifecycle event stream. When a sink is
+// configured, the cache reports set, promotion, expiration, delete, replace
+// and eviction events (each carrying the item key and generation, never its
+// value) to the sink from a dedicated goroutine.
+//
+// Events are delivered through a bounded buffer (see EventBuffer). If the sink
+// cannot keep up, the newest events are discarded and counted, never blocking
+// cache operations. Passing nil (the default) disables the feature
+// completely: no dispatcher goroutine is started and the Get/Set paths do no
+// extra allocations.
+func (c *Configuration[T]) EventSink(sink EventSink) *Configuration[T] {
+	c.eventSink = sink
+	return c
+}
+
+// EventBuffer sets the capacity of the buffered channel between the cache and
+// the configured EventSink. If it is full when an event is produced because
+// the sink is slow, the event is dropped and DroppedEvents is incremented.
+// Values smaller than 1 fall back to the default of 1024.
+// [1024]
+func (c *Configuration[T]) EventBuffer(size uint32) *Configuration[T] {
+	c.eventBuffer = int(size)
 	return c
 }
