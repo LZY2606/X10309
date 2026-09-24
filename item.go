@@ -26,11 +26,19 @@ type Item[T any] struct {
 	refCount   int32
 	expires    int64
 	size       int64
+	generation uint64
+	terminal   int32
+	termKind   EventKind
 	value      T
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
 }
+
+// Process-wide item generation counter. Every item instance gets a unique,
+// monotonically increasing generation, which is what Event.Generation refers
+// to. It is only an identifier; its absolute value carries no semantics.
+var itemGeneration uint64
 
 func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 	size := int64(1)
@@ -46,6 +54,7 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		generation: atomic.AddUint64(&itemGeneration, 1),
 	}
 	if track {
 		item.refCount = 1

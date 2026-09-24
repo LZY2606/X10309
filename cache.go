@@ -17,6 +17,10 @@ type Cache[T any] struct {
 	bucketMask      uint32
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	events          chan Event
+	eventsDone      chan struct{}
+	eventsClosed    int32
+	droppedEvents   int64
 }
 
 // Create a new cache with the specified configuration
@@ -36,6 +40,11 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 		c.buckets[i] = &bucket[T]{
 			lookup: make(map[string]*Item[T]),
 		}
+	}
+	if config.onEvent != nil {
+		c.events = make(chan Event, config.eventBuffer)
+		c.eventsDone = make(chan struct{})
+		go c.dispatchEvents()
 	}
 	go c.worker()
 	return c
@@ -88,6 +97,8 @@ func (c *Cache[T]) Get(key string) *Item[T] {
 		case c.promotables <- item:
 		default:
 		}
+	} else {
+		c.emitTerminal(EventExpiration, item)
 	}
 	return item
 }
@@ -123,7 +134,9 @@ func (c *Cache[T]) Set(key string, value T, duration time.Duration) {
 
 // Setnx set the value in the cache for the specified duration if not exists
 func (c *Cache[T]) Setnx(key string, value T, duration time.Duration) {
-	c.bucket(key).setnx(key, value, duration, false)
+	if item, created := c.bucket(key).setnx(key, value, duration, false); created {
+		c.emitEvent(EventSet, item)
+	}
 }
 
 // Setnx2 set the value in the cache for the specified duration if not exists
@@ -137,6 +150,7 @@ func (c *Cache[T]) Setnx2(key string, f func() T, duration time.Duration) *Item[
 		}
 		// consistent with set
 	} else if !existing {
+		c.emitEvent(EventSet, item)
 		c.promotables <- item
 	}
 	return item
@@ -188,6 +202,7 @@ func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, er
 func (c *Cache[T]) Delete(key string) bool {
 	item := c.bucket(key).remove(key)
 	if item != nil {
+		item.termKind = EventDelete
 		c.deletables <- item
 		return true
 	}
@@ -196,11 +211,24 @@ func (c *Cache[T]) Delete(key string) bool {
 
 func (c *Cache[T]) set(key string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(key).set(key, value, duration, track)
+	// Emit the set before queueing the replaced item so that, for an
+	// overwrite, the event stream always shows the new generation's set
+	// before the old generation's replace.
+	c.emitEvent(EventSet, item)
 	if existing != nil {
+		existing.termKind = EventReplace
 		c.deletables <- existing
 	}
 	c.promotables <- item
 	return item
+}
+
+// DroppedEvents returns the number of events that were dropped because the
+// event queue was full (slow sink) or because they were emitted after the
+// cache was stopped. It only ever grows while a sink is configured; without
+// a sink no events are produced and this stays 0.
+func (c *Cache[T]) DroppedEvents() int64 {
+	return atomic.LoadInt64(&c.droppedEvents)
 }
 
 func (c *Cache[T]) bucket(key string) *bucket[T] {
@@ -294,8 +322,14 @@ drain:
 		case item := <-c.deletables:
 			c.doDelete(item)
 		default:
-			return
+			goto stop
 		}
+	}
+
+stop:
+	if c.events != nil {
+		atomic.StoreInt32(&c.eventsClosed, 1)
+		close(c.eventsDone)
 	}
 }
 
@@ -331,6 +365,10 @@ doAllDeletes:
 }
 
 func (c *Cache[T]) doDelete(item *Item[T]) {
+	kind := item.termKind
+	if kind == 0 {
+		kind = EventDelete
+	}
 	if !item.inList {
 		item.promotions = -2
 	} else {
@@ -341,6 +379,7 @@ func (c *Cache[T]) doDelete(item *Item[T]) {
 		c.list.Remove(item)
 		item.promotions = -2
 	}
+	c.emitTerminal(kind, item)
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
@@ -353,6 +392,7 @@ func (c *Cache[T]) doPromote(item *Item[T]) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
+			c.emitEvent(EventPromotion, item)
 		}
 		return false
 	}
@@ -384,6 +424,7 @@ func (c *Cache[T]) gc() int {
 			if c.onDelete != nil {
 				c.onDelete(item)
 			}
+			c.emitTerminal(EventEviction, item)
 			dropped += 1
 			item.promotions = -2
 		}
