@@ -9,6 +9,7 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	nextGen func() int64
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -35,16 +36,13 @@ func (b *bucket[T]) get(key string) *Item[T] {
 	return b.lookup[key]
 }
 
-func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) *Item[T] {
+func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) (*Item[T], bool) {
 	b.RLock()
 	item := b.lookup[key]
 	b.RUnlock()
 	if item != nil {
-		return item
+		return item, false
 	}
-
-	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, value, expires, track)
 
 	b.Lock()
 	defer b.Unlock()
@@ -52,11 +50,13 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 	// check again under write lock
 	item = b.lookup[key]
 	if item != nil {
-		return item
+		return item, false
 	}
 
+	expires := time.Now().Add(duration).UnixNano()
+	newItem := newItem(key, value, expires, b.generation(), track)
 	b.lookup[key] = newItem
-	return newItem
+	return newItem, true
 }
 
 func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track bool) (*Item[T], bool) {
@@ -77,7 +77,7 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 	}
 
 	expires := time.Now().Add(duration).UnixNano()
-	newItem := newItem(key, f(), expires, track)
+	newItem := newItem(key, f(), expires, b.generation(), track)
 
 	b.lookup[key] = newItem
 	return newItem, false
@@ -85,12 +85,19 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 
 func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
 	expires := time.Now().Add(duration).UnixNano()
-	item := newItem(key, value, expires, track)
+	item := newItem(key, value, expires, b.generation(), track)
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
 	b.Unlock()
 	return item, existing
+}
+
+func (b *bucket[T]) generation() int64 {
+	if b.nextGen == nil {
+		return 0
+	}
+	return b.nextGen()
 }
 
 func (b *bucket[T]) remove(key string) *Item[T] {
@@ -99,6 +106,43 @@ func (b *bucket[T]) remove(key string) *Item[T] {
 	delete(b.lookup, key)
 	b.Unlock()
 	return item
+}
+
+// takeIfSame removes the key only if the mapped generation is still the one
+// being evicted. It returns the detached item, or nil if a newer generation
+// already replaced it. This keeps eviction from racing an overwrite.
+func (b *bucket[T]) takeIfSame(key string, expected *Item[T]) *Item[T] {
+	b.Lock()
+	defer b.Unlock()
+	if b.lookup[key] != expected {
+		return nil
+	}
+	delete(b.lookup, key)
+	return expected
+}
+
+// removeEntry detaches an item that was previously collected. It is a no-op
+// when a newer generation occupies the key.
+func (b *bucket[T]) removeEntry(item *Item[T]) bool {
+	b.Lock()
+	defer b.Unlock()
+	if b.lookup[item.key] != item {
+		return false
+	}
+	delete(b.lookup, item.key)
+	return true
+}
+
+// removeEntryAt is removeEntry keyed by an explicit key, used by layered
+// buckets.
+func (b *bucket[T]) removeEntryAt(key string, expected *Item[T]) bool {
+	b.Lock()
+	defer b.Unlock()
+	if b.lookup[key] != expected {
+		return false
+	}
+	delete(b.lookup, key)
+	return true
 }
 
 func (b *bucket[T]) delete(key string) {
@@ -114,39 +158,37 @@ func (b *bucket[T]) delete(key string) {
 // 2 - Do a second iteration, under write lock, for the matched results to do
 //     the actual deletion
 
-// Also, this is the only place where the Bucket is aware of cache detail: the
-// deletables channel. Passing it here lets us avoid iterating over matched items
-// again in the cache. Further, we pass item to deletables BEFORE actually removing
-// the item from the map. I'm pretty sure this is 100% fine, but it is unique.
-// (We do this so that the write to the channel is under the read lock and not the
-// write lock)
-func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan *Item[T]) int {
+// The entries are handed to the caller (outside of every lock) for the
+// asynchronous teardown: user supplied callbacks and event sinks must never
+// run while a bucket lock is held.
+func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan removal[T]) int {
 	lookup := b.lookup
 	items := make([]*Item[T], 0)
 
-	b.RLock()
+	b.Lock()
 	for key, item := range lookup {
 		if matches(key, item) {
-			deletables <- item
 			items = append(items, item)
 		}
 	}
-	b.RUnlock()
-
 	if len(items) == 0 {
-		// avoid the write lock if we can
+		b.Unlock()
 		return 0
 	}
-
-	b.Lock()
 	for _, item := range items {
-		delete(lookup, item.key)
+		if lookup[item.key] == item {
+			delete(lookup, item.key)
+		}
 	}
 	b.Unlock()
+
+	for _, item := range items {
+		deletables <- removal[T]{item: item, reason: ReasonExplicit}
+	}
 	return len(items)
 }
 
-func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
+func (b *bucket[T]) deletePrefix(prefix string, deletables chan removal[T]) int {
 	return b.deleteFunc(func(key string, item *Item[T]) bool {
 		return strings.HasPrefix(key, prefix)
 	}, deletables)

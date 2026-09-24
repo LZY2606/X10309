@@ -2,7 +2,6 @@
 package ccache
 
 import (
-	"hash/fnv"
 	"sync/atomic"
 	"time"
 )
@@ -15,13 +14,15 @@ type LayeredCache[T any] struct {
 	bucketMask      uint32
 	size            int64
 	pruneTargetSize int64
-	deletables      chan *Item[T]
+	deletables      chan removal[T]
 	promotables     chan *Item[T]
+	events          *eventHub
+	generations     generationCounter
 }
 
 // Create a new layered cache with the specified configuration.
 // A layered cache used a two keys to identify a value: a primary key
-// and a secondary key. Get, Set and Delete require both a primary and
+// and a secondary key. Get, Set and Delete require both a primary and a
 // secondary key. However, DeleteAll requires only a primary key, deleting
 // all values that share the same primary key.
 
@@ -39,13 +40,15 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 		control:         newControl(),
 		bucketMask:      uint32(config.buckets) - 1,
 		buckets:         make([]*layeredBucket[T], config.buckets),
-		deletables:      make(chan *Item[T], config.deleteBuffer),
+		deletables:      make(chan removal[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		events:          newEventHub(config.sink, config.eventBuffer),
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
 			buckets: make(map[string]*bucket[T]),
+			nextGen: c.generations.generation,
 		}
 	}
 	go c.worker()
@@ -65,16 +68,16 @@ func (c *LayeredCache[T]) ItemCount() int {
 // is expired and item.TTL() to see how long until the item expires (which
 // will be negative for an already expired item).
 func (c *LayeredCache[T]) Get(primary, secondary string) *Item[T] {
-	item := c.bucket(primary).get(primary, secondary)
+	bucket := c.bucket(primary)
+	item := bucket.get(primary, secondary)
 	if item == nil {
 		return nil
 	}
-	if item.expires > time.Now().UnixNano() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
+	if item.Expired() {
+		c.expire(bucket, primary, secondary, item)
+		return item
 	}
+	c.queuePromotion(item, false)
 	return item
 }
 
@@ -97,7 +100,7 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	bkt := primaryBkt.getSecondaryBucket(primary)
 	primaryBkt.Lock()
 	if bkt == nil {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), nextGen: c.generations.generation}
 		primaryBkt.buckets[primary] = bkt
 	}
 	primaryBkt.Unlock()
@@ -162,7 +165,7 @@ func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duratio
 func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 	item := c.bucket(primary).remove(primary, secondary)
 	if item != nil {
-		c.deletables <- item
+		c.enqueueRemoval(item, ReasonExplicit)
 		return true
 	}
 	return false
@@ -170,7 +173,14 @@ func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 
 // Deletes all items that share the same primary key
 func (c *LayeredCache[T]) DeleteAll(primary string) bool {
-	return c.bucket(primary).deleteAll(primary, c.deletables)
+	items, ok := c.bucket(primary).detachAll(primary)
+	if !ok {
+		return false
+	}
+	for _, item := range items {
+		c.enqueueRemoval(item, ReasonExplicit)
+	}
+	return true
 }
 
 // Deletes all items that share the same primary key and prefix.
@@ -186,16 +196,48 @@ func (c *LayeredCache[T]) DeleteFunc(primary string, matches func(key string, it
 func (c *LayeredCache[T]) set(primary, secondary string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track)
 	if existing != nil {
-		c.deletables <- existing
+		c.enqueueRemoval(existing, ReasonReplaced)
+		c.installed(item, ReasonOverwritten)
+	} else {
+		c.installed(item, ReasonInsert)
 	}
 	c.promote(item)
 	return item
 }
 
+func (c *LayeredCache[T]) installed(item *Item[T], reason Reason) {
+	c.events.emit(c.event(EventSet, reason, item))
+}
+
+func (c *LayeredCache[T]) event(typ EventType, reason Reason, item *Item[T]) Event {
+	return Event{
+		Type:       typ,
+		Reason:     reason,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.Generation(),
+		Size:       item.size,
+		At:         time.Now(),
+	}
+}
+
+func (c *LayeredCache[T]) enqueueRemoval(item *Item[T], reason Reason) {
+	c.deletables <- removal[T]{item: item, reason: reason}
+}
+
+func (c *LayeredCache[T]) expire(bucket *layeredBucket[T], primary, secondary string, item *Item[T]) {
+	if c.events == nil {
+		return
+	}
+	select {
+	case c.deletables <- removal[T]{item: item, reason: ReasonTTL}:
+		bucket.removeEntry(primary, secondary, item)
+	default:
+	}
+}
+
 func (c *LayeredCache[T]) bucket(key string) *layeredBucket[T] {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return c.buckets[h.Sum32()&c.bucketMask]
+	return c.buckets[fnv1a32(key)&c.bucketMask]
 }
 
 func (c *LayeredCache[T]) halted(fn func()) {
@@ -220,6 +262,31 @@ func (c *LayeredCache[T]) promote(item *Item[T]) {
 	c.promotables <- item
 }
 
+func (c *LayeredCache[T]) queuePromotion(item *Item[T], initial bool) {
+	if initial {
+		c.promotables <- item
+		return
+	}
+	select {
+	case c.promotables <- item:
+	default:
+		c.events.emit(c.event(EventPromotion, ReasonQueueFull, item))
+	}
+}
+
+// GetDroppedEvents returns the number of lifecycle events that were discarded
+// because the configured event sink could not keep up. The counter is
+// cumulative and never reset.
+func (c *LayeredCache[T]) GetDroppedEvents() int64 {
+	return c.events.droppedCount()
+}
+
+// Stop shuts down the worker and the event delivery goroutine.
+func (c *LayeredCache[T]) Stop() {
+	c.control.Stop()
+	c.events.close()
+}
+
 func (c *LayeredCache[T]) worker() {
 	dropped := 0
 	cc := c.control
@@ -234,8 +301,8 @@ func (c *LayeredCache[T]) worker() {
 		select {
 		case item := <-c.promotables:
 			promoteItem(item)
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal.item, removal.reason)
 		case control := <-cc:
 			switch msg := control.(type) {
 			case controlStop:
@@ -284,43 +351,64 @@ func (c *LayeredCache[T]) worker() {
 drain:
 	for {
 		select {
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal.item, removal.reason)
 		default:
 			return
 		}
 	}
 }
 
-func (c *LayeredCache[T]) doDelete(item *Item[T]) {
+func (c *LayeredCache[T]) doDelete(item *Item[T], reason Reason) {
 	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
+		if item.markTerminal() {
+			c.emitTerminal(item, reason)
 		}
-		c.list.Remove(item)
-		item.promotions = -2
+		return
 	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
+	if item.markTerminal() {
+		c.emitTerminal(item, reason)
+	}
+}
+
+func (c *LayeredCache[T]) emitTerminal(item *Item[T], reason Reason) {
+	var typ EventType
+	switch reason {
+	case ReasonTTL:
+		typ = EventExpiration
+	case ReasonExplicit:
+		typ = EventDelete
+	case ReasonReplaced:
+		typ = EventReplace
+	default:
+		typ = EventDelete
+	}
+	c.events.emit(c.event(typ, reason, item))
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	if item.terminal() {
 		return false
 	}
 
 	if item.inList {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
-			item.promotions = 0
+			atomic.StoreInt32(&item.promotions, 0)
+			c.events.emit(c.event(EventPromotion, ReasonMoved, item))
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	c.events.emit(c.event(EventPromotion, ReasonQueued, item))
 	return true
 }
 
@@ -337,18 +425,18 @@ func (c *LayeredCache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			if detached := c.bucket(item.group).takeIfSame(item.group, item.key, item); detached != nil && item.markTerminal() {
+				itemSize := item.size
+				c.size -= itemSize
+				prunedSize += itemSize
 
-			c.bucket(item.group).delete(item.group, item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
+				c.list.Remove(item)
+				if c.onDelete != nil {
+					c.onDelete(item)
+				}
+				c.events.emit(c.event(EventEviction, ReasonCapacity, item))
+				dropped += 1
 			}
-			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

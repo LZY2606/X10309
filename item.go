@@ -26,13 +26,14 @@ type Item[T any] struct {
 	refCount   int32
 	expires    int64
 	size       int64
+	generation int64
 	value      T
 	next       *Item[T]
 	prev       *Item[T]
 	inList     bool
 }
 
-func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
+func newItem[T any](key string, value T, expires int64, generation int64, track bool) *Item[T] {
 	size := int64(1)
 
 	// https://github.com/golang/go/issues/49206
@@ -46,6 +47,7 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 		promotions: 0,
 		size:       size,
 		expires:    expires,
+		generation: generation,
 	}
 	if track {
 		item.refCount = 1
@@ -54,12 +56,37 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 }
 
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
-	i.promotions += 1
-	return i.promotions == getsPerPromote
+	return atomic.AddInt32(&i.promotions, 1) == getsPerPromote
 }
 
 func (i *Item[T]) Key() string {
 	return i.key
+}
+
+// Generation is the dense, per-cache sequence number assigned when the item
+// was stored. It uniquely identifies a specific value of a key, which lets an
+// event trace distinguish an overwrite from the original generation.
+func (i *Item[T]) Generation() int64 {
+	return atomic.LoadInt64(&i.generation)
+}
+
+// markTerminal transitions an item into its removed state exactly once. It
+// returns true only for the caller that performed the transition, so the
+// single terminal event of a generation can be emitted by exactly one path.
+func (i *Item[T]) markTerminal() bool {
+	for {
+		promotions := atomic.LoadInt32(&i.promotions)
+		if promotions == -2 {
+			return false
+		}
+		if atomic.CompareAndSwapInt32(&i.promotions, promotions, -2) {
+			return true
+		}
+	}
+}
+
+func (i *Item[T]) terminal() bool {
+	return atomic.LoadInt32(&i.promotions) == -2
 }
 
 func (i *Item[T]) Value() T {

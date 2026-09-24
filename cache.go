@@ -2,7 +2,6 @@
 package ccache
 
 import (
-	"hash/fnv"
 	"sync/atomic"
 	"time"
 )
@@ -15,8 +14,17 @@ type Cache[T any] struct {
 	pruneTargetSize int64
 	buckets         []*bucket[T]
 	bucketMask      uint32
-	deletables      chan *Item[T]
+	deletables      chan removal[T]
 	promotables     chan *Item[T]
+	events          *eventHub
+	generations     generationCounter
+}
+
+// removal carries an item that left a bucket map to the worker, together with
+// why it was detached.
+type removal[T any] struct {
+	item   *Item[T]
+	reason Reason
 }
 
 // Create a new cache with the specified configuration
@@ -28,13 +36,15 @@ func New[T any](config *Configuration[T]) *Cache[T] {
 		control:         newControl(),
 		bucketMask:      uint32(config.buckets) - 1,
 		buckets:         make([]*bucket[T], config.buckets),
-		deletables:      make(chan *Item[T], config.deleteBuffer),
+		deletables:      make(chan removal[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		events:          newEventHub(config.sink, config.eventBuffer),
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &bucket[T]{
-			lookup: make(map[string]*Item[T]),
+			lookup:  make(map[string]*Item[T]),
+			nextGen: c.generations.generation,
 		}
 	}
 	go c.worker()
@@ -79,16 +89,16 @@ func (c *Cache[T]) ForEachFunc(matches func(key string, item *Item[T]) bool) {
 // is expired and item.TTL() to see how long until the item expires (which
 // will be negative for an already expired item).
 func (c *Cache[T]) Get(key string) *Item[T] {
-	item := c.bucket(key).get(key)
+	bucket := c.bucket(key)
+	item := bucket.get(key)
 	if item == nil {
 		return nil
 	}
-	if !item.Expired() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
+	if item.Expired() {
+		c.expire(bucket, item)
+		return item
 	}
+	c.queuePromotion(item, false)
 	return item
 }
 
@@ -123,7 +133,10 @@ func (c *Cache[T]) Set(key string, value T, duration time.Duration) {
 
 // Setnx set the value in the cache for the specified duration if not exists
 func (c *Cache[T]) Setnx(key string, value T, duration time.Duration) {
-	c.bucket(key).setnx(key, value, duration, false)
+	item, inserted := c.bucket(key).setnx(key, value, duration, false)
+	if inserted {
+		c.installed(item, ReasonInsert)
+	}
 }
 
 // Setnx2 set the value in the cache for the specified duration if not exists
@@ -131,13 +144,11 @@ func (c *Cache[T]) Setnx2(key string, f func() T, duration time.Duration) *Item[
 	item, existing := c.bucket(key).setnx2(key, f, duration, false)
 	// consistent with Get
 	if existing && !item.Expired() {
-		select {
-		case c.promotables <- item:
-		default:
-		}
+		c.queuePromotion(item, false)
 		// consistent with set
 	} else if !existing {
-		c.promotables <- item
+		c.installed(item, ReasonInsert)
+		c.queuePromotion(item, true)
 	}
 	return item
 }
@@ -188,7 +199,7 @@ func (c *Cache[T]) Fetch(key string, duration time.Duration, fetch func() (T, er
 func (c *Cache[T]) Delete(key string) bool {
 	item := c.bucket(key).remove(key)
 	if item != nil {
-		c.deletables <- item
+		c.enqueueRemoval(item, ReasonExplicit)
 		return true
 	}
 	return false
@@ -197,16 +208,69 @@ func (c *Cache[T]) Delete(key string) bool {
 func (c *Cache[T]) set(key string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(key).set(key, value, duration, track)
 	if existing != nil {
-		c.deletables <- existing
+		c.enqueueRemoval(existing, ReasonReplaced)
+		c.installed(item, ReasonOverwritten)
+	} else {
+		c.installed(item, ReasonInsert)
 	}
-	c.promotables <- item
+	c.queuePromotion(item, true)
 	return item
 }
 
+// installed emits the set event for a newly stored generation.
+func (c *Cache[T]) installed(item *Item[T], reason Reason) {
+	c.events.emit(c.event(EventSet, reason, item))
+}
+
+// event builds an Event from an item. The cached value is intentionally never
+// copied into the event.
+func (c *Cache[T]) event(typ EventType, reason Reason, item *Item[T]) Event {
+	return Event{
+		Type:       typ,
+		Reason:     reason,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.Generation(),
+		Size:       item.size,
+		At:         time.Now(),
+	}
+}
+
+func (c *Cache[T]) enqueueRemoval(item *Item[T], reason Reason) {
+	c.deletables <- removal[T]{item: item, reason: reason}
+}
+
+// expire detaches an expired item lazily from a Get. The (still returned)
+// expired item is unreachable to subsequent lookups.
+func (c *Cache[T]) expire(bucket *bucket[T], item *Item[T]) {
+	if c.events == nil {
+		return
+	}
+	select {
+	case c.deletables <- removal[T]{item: item, reason: ReasonTTL}:
+		if !bucket.removeEntry(item) {
+			return
+		}
+	default:
+		// The teardown queue is congested; leave the item's bookkeeping to a
+		// later expiration or capacity sweep rather than blocking a Get.
+	}
+}
+
+func (c *Cache[T]) queuePromotion(item *Item[T], initial bool) {
+	if initial {
+		c.promotables <- item
+		return
+	}
+	select {
+	case c.promotables <- item:
+	default:
+		c.events.emit(c.event(EventPromotion, ReasonQueueFull, item))
+	}
+}
+
 func (c *Cache[T]) bucket(key string) *bucket[T] {
-	h := fnv.New32a()
-	h.Write([]byte(key))
-	return c.buckets[h.Sum32()&c.bucketMask]
+	return c.buckets[fnv1a32(key)&c.bucketMask]
 }
 
 func (c *Cache[T]) halted(fn func()) {
@@ -227,6 +291,19 @@ func (c *Cache[T]) unhalt() {
 	}
 }
 
+// GetDroppedEvents returns the number of lifecycle events that were discarded
+// because the configured event sink could not keep up. The counter is
+// cumulative and never reset.
+func (c *Cache[T]) GetDroppedEvents() int64 {
+	return c.events.droppedCount()
+}
+
+// Stop shuts down the worker and the event delivery goroutine.
+func (c *Cache[T]) Stop() {
+	c.control.Stop()
+	c.events.close()
+}
+
 func (c *Cache[T]) worker() {
 	dropped := 0
 	cc := c.control
@@ -241,8 +318,8 @@ func (c *Cache[T]) worker() {
 		select {
 		case item := <-c.promotables:
 			promoteItem(item)
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal.item, removal.reason)
 		case control := <-cc:
 			switch msg := control.(type) {
 			case controlStop:
@@ -291,8 +368,8 @@ func (c *Cache[T]) worker() {
 drain:
 	for {
 		select {
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal.item, removal.reason)
 		default:
 			return
 		}
@@ -307,8 +384,8 @@ drain:
 func doAllPendingPromotesAndDeletes[T any](
 	promotables <-chan *Item[T],
 	promoteFn func(*Item[T]),
-	deletables <-chan *Item[T],
-	deleteFn func(*Item[T]),
+	deletables <-chan removal[T],
+	deleteFn func(*Item[T], Reason),
 ) {
 doAllPromotes:
 	for {
@@ -317,48 +394,71 @@ doAllPromotes:
 			promoteFn(item)
 		default:
 			break doAllPromotes
+
 		}
 	}
 doAllDeletes:
 	for {
 		select {
-		case item := <-deletables:
-			deleteFn(item)
+		case removal := <-deletables:
+			deleteFn(removal.item, removal.reason)
 		default:
 			break doAllDeletes
 		}
 	}
 }
 
-func (c *Cache[T]) doDelete(item *Item[T]) {
+func (c *Cache[T]) doDelete(item *Item[T], reason Reason) {
 	if !item.inList {
-		item.promotions = -2
-	} else {
-		c.size -= item.size
-		if c.onDelete != nil {
-			c.onDelete(item)
+		if item.markTerminal() {
+			c.emitTerminal(item, reason)
 		}
-		c.list.Remove(item)
-		item.promotions = -2
+		return
 	}
+	c.size -= item.size
+	if c.onDelete != nil {
+		c.onDelete(item)
+	}
+	c.list.Remove(item)
+	if item.markTerminal() {
+		c.emitTerminal(item, reason)
+	}
+}
+
+// emitTerminal maps a removal reason to the terminal event of the generation.
+func (c *Cache[T]) emitTerminal(item *Item[T], reason Reason) {
+	var typ EventType
+	switch reason {
+	case ReasonTTL:
+		typ = EventExpiration
+	case ReasonExplicit:
+		typ = EventDelete
+	case ReasonReplaced:
+		typ = EventReplace
+	default:
+		typ = EventDelete
+	}
+	c.events.emit(c.event(typ, reason, item))
 }
 
 func (c *Cache[T]) doPromote(item *Item[T]) bool {
 	// already deleted
-	if item.promotions == -2 {
+	if item.terminal() {
 		return false
 	}
 
 	if item.inList {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
-			item.promotions = 0
+			atomic.StoreInt32(&item.promotions, 0)
+			c.events.emit(c.event(EventPromotion, ReasonMoved, item))
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	c.events.emit(c.event(EventPromotion, ReasonQueued, item))
 	return true
 }
 
@@ -375,17 +475,18 @@ func (c *Cache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
-			c.bucket(item.key).delete(item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
+			if detached := c.bucket(item.key).takeIfSame(item.key, item); detached != nil && item.markTerminal() {
+				itemSize := item.size
+				c.size -= itemSize
+				prunedSize += itemSize
 
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
+				c.list.Remove(item)
+				if c.onDelete != nil {
+					c.onDelete(item)
+				}
+				c.events.emit(c.event(EventEviction, ReasonCapacity, item))
+				dropped += 1
 			}
-			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

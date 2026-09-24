@@ -9,6 +9,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	sink           EventSink
+	eventBuffer    int
 }
 
 // Creates a configuration object with sensible defaults
@@ -102,5 +104,27 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// Events opts in to an opt-in lifecycle event trace. When configured, the
+// cache emits set, promotion, expiration, delete, replace and eviction events
+// (with their reason and item generation) to the sink from a dedicated
+// goroutine. Events are delivered with a bounded buffer: if the sink is too
+// slow, events are dropped rather than blocking cache operations, and the
+// number of dropped events is available through GetDroppedEvents.
+// A nil sink disables the trace (the default) and keeps the cache free of
+// any tracing overhead.
+func (c *Configuration[T]) Events(sink EventSink) *Configuration[T] {
+	c.sink = sink
+	return c
+}
+
+// EventBuffer configures the size of the bounded queue between the cache and
+// the event sink. It only has an effect when Events was also configured. The
+// default is 1024. Events produced while the queue is full are dropped and
+// counted.
+func (c *Configuration[T]) EventBuffer(size uint32) *Configuration[T] {
+	c.eventBuffer = int(size)
 	return c
 }
