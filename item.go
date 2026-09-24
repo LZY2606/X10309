@@ -26,6 +26,7 @@ type Item[T any] struct {
 	refCount   int32
 	expires    int64
 	size       int64
+	gen        int64
 	value      T
 	next       *Item[T]
 	prev       *Item[T]
@@ -60,6 +61,15 @@ func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
 
 func (i *Item[T]) Key() string {
 	return i.key
+}
+
+// Generation returns the item's generation: a monotonically increasing,
+// per-cache value assigned to each distinct item object at creation. Every
+// lifecycle event for the same item object carries the same generation, so a
+// replacement can be distinguished from an update of an existing item without
+// exposing the cached value.
+func (i *Item[T]) Generation() int64 {
+	return i.gen
 }
 
 func (i *Item[T]) Value() T {

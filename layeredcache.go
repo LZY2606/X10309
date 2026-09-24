@@ -15,8 +15,10 @@ type LayeredCache[T any] struct {
 	bucketMask      uint32
 	size            int64
 	pruneTargetSize int64
-	deletables      chan *Item[T]
+	deletables      chan itemDelete[T]
 	promotables     chan *Item[T]
+	events          *eventBus
+	nextGen         int64
 }
 
 // Create a new layered cache with the specified configuration.
@@ -39,8 +41,9 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 		control:         newControl(),
 		bucketMask:      uint32(config.buckets) - 1,
 		buckets:         make([]*layeredBucket[T], config.buckets),
-		deletables:      make(chan *Item[T], config.deleteBuffer),
+		deletables:      make(chan *itemDelete[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
+		events:          newEventBus(config.eventSink, config.eventBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
 	}
 	for i := 0; i < config.buckets; i++ {
@@ -102,8 +105,9 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	}
 	primaryBkt.Unlock()
 	return &SecondaryCache[T]{
-		bucket: bkt,
-		pCache: c,
+		primary: primary,
+		bucket:  bkt,
+		pCache:  c,
 	}
 }
 
@@ -162,7 +166,7 @@ func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duratio
 func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 	item := c.bucket(primary).remove(primary, secondary)
 	if item != nil {
-		c.deletables <- item
+		c.deletables <- itemDelete[T]{item: item, reason: ReasonExplicit}
 		return true
 	}
 	return false
@@ -183,10 +187,18 @@ func (c *LayeredCache[T]) DeleteFunc(primary string, matches func(key string, it
 	return c.bucket(primary).deleteFunc(primary, matches, c.deletables)
 }
 
+func (c *LayeredCache[T]) nextGeneration() int64 {
+	if !c.events.enabled() {
+		return 0
+	}
+	return atomic.AddInt64(&c.nextGen, 1)
+}
+
 func (c *LayeredCache[T]) set(primary, secondary string, value T, duration time.Duration, track bool) *Item[T] {
-	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track)
+	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track, c.nextGeneration())
+	c.events.emit(Event{Group: primary, Key: secondary, Type: EventSet, Reason: ReasonInsert, Generation: item.gen})
 	if existing != nil {
-		c.deletables <- existing
+		c.deletables <- itemDelete[T]{item: existing, reason: ReasonOverwritten}
 	}
 	c.promote(item)
 	return item
@@ -223,6 +235,7 @@ func (c *LayeredCache[T]) promote(item *Item[T]) {
 func (c *LayeredCache[T]) worker() {
 	dropped := 0
 	cc := c.control
+	var stopAck chan struct{}
 
 	promoteItem := func(item *Item[T]) {
 		if c.doPromote(item) && c.size > c.maxSize {
@@ -230,19 +243,21 @@ func (c *LayeredCache[T]) worker() {
 		}
 	}
 
-	for {
+	for stopAck == nil {
 		select {
 		case item := <-c.promotables:
 			promoteItem(item)
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal)
 		case control := <-cc:
 			switch msg := control.(type) {
 			case controlStop:
-				goto drain
+				stopAck = msg.ack
 			case controlGetDropped:
 				msg.res <- dropped
 				dropped = 0
+			case controlGetDroppedEvents:
+				msg.res <- c.events.droppedCount()
 			case controlSetMaxSize:
 				newMaxSize := msg.size
 				c.maxSize = newMaxSize
@@ -281,28 +296,64 @@ func (c *LayeredCache[T]) worker() {
 		}
 	}
 
-drain:
+	// Stop was requested. Drain everything already queued so that terminal
+	// events are not lost, then flush the event pump (and its sink) before
+	// Stop returns. Pending promotions are left to expire with the cache.
 	for {
 		select {
-		case item := <-c.deletables:
-			c.doDelete(item)
+		case item := <-c.promotables:
+			promoteItem(item)
+		case removal := <-c.deletables:
+			c.doDelete(removal)
 		default:
+			c.events.stop()
+			stopAck <- struct{}{}
 			return
 		}
 	}
 }
 
-func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+func (c *LayeredCache[T]) doDelete(removal *itemDelete[T]) {
+	item := removal.item
+	// At most one terminal transition per item object; the sentinel is only
+	// ever written by this worker goroutine.
+	if item.promotions == -2 {
+		return
+	}
+	wasInList := item.inList
+	if wasInList {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
 		c.list.Remove(item)
-		item.promotions = -2
 	}
+	item.promotions = -2
+	c.emitTerminal(item, removal.reason)
+}
+
+func (c *LayeredCache[T]) emitTerminal(item *Item[T], reason Reason) {
+	eventType := EventDelete
+	switch reason {
+	case ReasonOverwritten:
+		eventType = EventReplace
+	case ReasonCapacity:
+		if item.Expired() {
+			eventType = EventExpiration
+			reason = ReasonTTL
+		} else {
+			eventType = EventEviction
+		}
+	default:
+		eventType = EventDelete
+	}
+	c.events.emit(Event{
+		Group:      item.group,
+		Key:        item.key,
+		Type:       eventType,
+		Reason:     reason,
+		Generation: item.gen,
+	})
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
@@ -315,12 +366,14 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
+			c.events.emit(Event{Group: item.group, Key: item.key, Type: EventPromotion, Reason: ReasonAccess, Generation: item.gen})
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	c.events.emit(Event{Group: item.group, Key: item.key, Type: EventPromotion, Reason: ReasonInsert, Generation: item.gen})
 	return true
 }
 
@@ -337,18 +390,20 @@ func (c *LayeredCache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			if item.promotions != -2 {
+				c.bucket(item.group).delete(item.group, item.key)
+				itemSize := item.size
+				c.size -= itemSize
+				prunedSize += itemSize
 
-			c.bucket(item.group).delete(item.group, item.key)
-			itemSize := item.size
-			c.size -= itemSize
-			prunedSize += itemSize
-
-			c.list.Remove(item)
-			if c.onDelete != nil {
-				c.onDelete(item)
+				c.list.Remove(item)
+				if c.onDelete != nil {
+					c.onDelete(item)
+				}
+				dropped += 1
+				item.promotions = -2
+				c.emitTerminal(item, ReasonCapacity)
 			}
-			dropped += 1
-			item.promotions = -2
 		}
 		item = prev
 	}

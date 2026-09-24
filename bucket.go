@@ -11,6 +11,14 @@ type bucket[T any] struct {
 	lookup map[string]*Item[T]
 }
 
+// itemDelete couples a doomed item with the cause of its removal, so the
+// worker can emit the correct terminal lifecycle event (delete, replace,
+// expiration or eviction) without inferring intent from item state.
+type itemDelete[T any] struct {
+	item   *Item[T]
+	reason Reason
+}
+
 func (b *bucket[T]) itemCount() int {
 	b.RLock()
 	defer b.RUnlock()
@@ -35,16 +43,17 @@ func (b *bucket[T]) get(key string) *Item[T] {
 	return b.lookup[key]
 }
 
-func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) *Item[T] {
+func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool, gen int64) (*Item[T], bool) {
 	b.RLock()
 	item := b.lookup[key]
 	b.RUnlock()
 	if item != nil {
-		return item
+		return item, false
 	}
 
 	expires := time.Now().Add(duration).UnixNano()
 	newItem := newItem(key, value, expires, track)
+	newItem.gen = gen
 
 	b.Lock()
 	defer b.Unlock()
@@ -52,14 +61,14 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 	// check again under write lock
 	item = b.lookup[key]
 	if item != nil {
-		return item
+		return item, false
 	}
 
 	b.lookup[key] = newItem
-	return newItem
+	return newItem, true
 }
 
-func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track bool) (*Item[T], bool) {
+func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track bool, gen int64) (*Item[T], bool) {
 	b.RLock()
 	item := b.lookup[key]
 	b.RUnlock()
@@ -78,14 +87,16 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 
 	expires := time.Now().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
+	newItem.gen = gen
 
 	b.lookup[key] = newItem
 	return newItem, false
 }
 
-func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
+func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool, gen int64) (*Item[T], *Item[T]) {
 	expires := time.Now().Add(duration).UnixNano()
 	item := newItem(key, value, expires, track)
+	item.gen = gen
 	b.Lock()
 	existing := b.lookup[key]
 	b.lookup[key] = item
@@ -120,14 +131,14 @@ func (b *bucket[T]) delete(key string) {
 // the item from the map. I'm pretty sure this is 100% fine, but it is unique.
 // (We do this so that the write to the channel is under the read lock and not the
 // write lock)
-func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan *Item[T]) int {
+func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan *itemDelete[T], reason Reason) int {
 	lookup := b.lookup
 	items := make([]*Item[T], 0)
 
 	b.RLock()
 	for key, item := range lookup {
 		if matches(key, item) {
-			deletables <- item
+			deletables <- itemDelete[T]{item: item, reason: reason}
 			items = append(items, item)
 		}
 	}
@@ -146,10 +157,10 @@ func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, del
 	return len(items)
 }
 
-func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
+func (b *bucket[T]) deletePrefix(prefix string, deletables chan *itemDelete[T]) int {
 	return b.deleteFunc(func(key string, item *Item[T]) bool {
 		return strings.HasPrefix(key, prefix)
-	}, deletables)
+	}, deletables, ReasonPrefix)
 }
 
 // we expect the caller to have acquired a write lock

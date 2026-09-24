@@ -38,7 +38,7 @@ func (b *layeredBucket[T]) getSecondaryBucket(primary string) *bucket[T] {
 	return bucket
 }
 
-func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time.Duration, track bool) (*Item[T], *Item[T]) {
+func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time.Duration, track bool, gen int64) (*Item[T], *Item[T]) {
 	b.Lock()
 	bkt, exists := b.buckets[primary]
 	if !exists {
@@ -46,7 +46,7 @@ func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time
 		b.buckets[primary] = bkt
 	}
 	b.Unlock()
-	item, existing := bkt.set(secondary, value, duration, track)
+	item, existing := bkt.set(secondary, value, duration, track, gen)
 	item.group = primary
 	return item, existing
 }
@@ -71,7 +71,7 @@ func (b *layeredBucket[T]) delete(primary, secondary string) {
 	bucket.delete(secondary)
 }
 
-func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T]) int {
+func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *itemDelete[T]) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
@@ -81,17 +81,17 @@ func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan 
 	return bucket.deletePrefix(prefix, deletables)
 }
 
-func (b *layeredBucket[T]) deleteFunc(primary string, matches func(key string, item *Item[T]) bool, deletables chan *Item[T]) int {
+func (b *layeredBucket[T]) deleteFunc(primary string, matches func(key string, item *Item[T]) bool, deletables chan *itemDelete[T]) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
 	if !exists {
 		return 0
 	}
-	return bucket.deleteFunc(matches, deletables)
+	return bucket.deleteFunc(matches, deletables, ReasonFunc)
 }
 
-func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *Item[T]) bool {
+func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *itemDelete[T]) bool {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
@@ -107,7 +107,7 @@ func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *Item[T]) b
 	}
 	for key, item := range bucket.lookup {
 		delete(bucket.lookup, key)
-		deletables <- item
+		deletables <- itemDelete[T]{item: item, reason: ReasonPrefix}
 	}
 	return true
 }

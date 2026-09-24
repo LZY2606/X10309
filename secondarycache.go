@@ -3,8 +3,9 @@ package ccache
 import "time"
 
 type SecondaryCache[T any] struct {
-	bucket *bucket[T]
-	pCache *LayeredCache[T]
+	primary string
+	bucket  *bucket[T]
+	pCache  *LayeredCache[T]
 }
 
 // Get the secondary key.
@@ -16,9 +17,10 @@ func (s *SecondaryCache[T]) Get(secondary string) *Item[T] {
 // Set the secondary key to a value.
 // The semantics are the same as for LayeredCache.Set
 func (s *SecondaryCache[T]) Set(secondary string, value T, duration time.Duration) *Item[T] {
-	item, existing := s.bucket.set(secondary, value, duration, false)
+	item, existing := s.bucket.set(secondary, value, duration, false, s.pCache.nextGeneration())
+	s.pCache.events.emit(Event{Group: s.primary, Key: secondary, Type: EventSet, Reason: ReasonInsert, Generation: item.gen})
 	if existing != nil {
-		s.pCache.deletables <- existing
+		s.pCache.deletables <- itemDelete[T]{item: existing, reason: ReasonOverwritten}
 	}
 	s.pCache.promote(item)
 	return item
@@ -43,7 +45,7 @@ func (s *SecondaryCache[T]) Fetch(secondary string, duration time.Duration, fetc
 func (s *SecondaryCache[T]) Delete(secondary string) bool {
 	item := s.bucket.remove(secondary)
 	if item != nil {
-		s.pCache.deletables <- item
+		s.pCache.deletables <- itemDelete[T]{item: item, reason: ReasonExplicit}
 		return true
 	}
 	return false

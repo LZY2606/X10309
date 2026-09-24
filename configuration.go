@@ -9,6 +9,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	eventSink      EventSink
+	eventBuffer    int
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +25,7 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		eventBuffer:    1024,
 	}
 }
 
@@ -102,5 +105,31 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// Events enables an opt-in lifecycle event sink. The sink receives, in
+// generation order per item, events for set, promotion, expiration, delete,
+// replace and eviction transitions, each annotated with a reason and the
+// item's generation. Events are delivered asynchronously and never carry the
+// cached value: see EventSink and Event for the delivery and drop semantics.
+// When Events is not configured, the cache behaves exactly as before and no
+// event-related allocation occurs on the Get path.
+func (c *Configuration[T]) Events(sink EventSink) *Configuration[T] {
+	c.eventSink = sink
+	return c
+}
+
+// EventBuffer sets the capacity of the internal, asynchronous event queue
+// used by the sink configured with Events. If the sink cannot keep up and the
+// buffer fills up, the newest events are dropped and counted (retrieved via
+// GetDroppedEvents); cache operations never block on a slow sink.
+// Must be a positive value; a zero value falls back to the default of 1024.
+// [1024]
+func (c *Configuration[T]) EventBuffer(size uint32) *Configuration[T] {
+	if size == 0 {
+		size = 1024
+	}
+	c.eventBuffer = int(size)
 	return c
 }

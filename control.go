@@ -9,6 +9,7 @@ type controlClear struct {
 }
 
 type controlStop struct {
+	ack chan struct{}
 }
 
 type controlGetSize struct {
@@ -16,6 +17,10 @@ type controlGetSize struct {
 }
 
 type controlGetDropped struct {
+	res chan int
+}
+
+type controlGetDroppedEvents struct {
 	res chan int
 }
 
@@ -50,7 +55,9 @@ func (c control) GC() {
 // This is a control command.
 func (c control) Stop() {
 	c.SyncUpdates()
-	c <- controlStop{}
+	ack := make(chan struct{}, 1)
+	c <- controlStop{ack: ack}
+	<-ack
 }
 
 // Clears the cache
@@ -107,4 +114,14 @@ func (c control) SyncUpdates() {
 	done := make(chan struct{})
 	c <- controlSyncUpdates{done: done}
 	<-done
+}
+
+// GetDroppedEvents returns the number of lifecycle events that were dropped
+// since the last call because the configured EventSink could not keep up with
+// the internal event buffer. Returns 0 when no sink is configured.
+// This is a control command.
+func (c control) GetDroppedEvents() int {
+	res := make(chan int)
+	c <- controlGetDroppedEvents{res: res}
+	return <-res
 }
