@@ -7,7 +7,8 @@ import (
 
 type layeredBucket[T any] struct {
 	sync.RWMutex
-	buckets map[string]*bucket[T]
+	buckets   map[string]*bucket[T]
+	genSource func() int64
 }
 
 func (b *layeredBucket[T]) itemCount() int {
@@ -42,7 +43,7 @@ func (b *layeredBucket[T]) set(primary, secondary string, value T, duration time
 	b.Lock()
 	bkt, exists := b.buckets[primary]
 	if !exists {
-		bkt = &bucket[T]{lookup: make(map[string]*Item[T])}
+		bkt = &bucket[T]{lookup: make(map[string]*Item[T]), genSource: b.genSource}
 		b.buckets[primary] = bkt
 	}
 	b.Unlock()
@@ -71,27 +72,27 @@ func (b *layeredBucket[T]) delete(primary, secondary string) {
 	bucket.delete(secondary)
 }
 
-func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T]) int {
+func (b *layeredBucket[T]) deletePrefix(primary, prefix string, deletables chan *Item[T], mark func(*Item[T])) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
 	if !exists {
 		return 0
 	}
-	return bucket.deletePrefix(prefix, deletables)
+	return bucket.deletePrefix(prefix, deletables, mark)
 }
 
-func (b *layeredBucket[T]) deleteFunc(primary string, matches func(key string, item *Item[T]) bool, deletables chan *Item[T]) int {
+func (b *layeredBucket[T]) deleteFunc(primary string, matches func(key string, item *Item[T]) bool, deletables chan *Item[T], mark func(*Item[T])) int {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
 	if !exists {
 		return 0
 	}
-	return bucket.deleteFunc(matches, deletables)
+	return bucket.deleteFunc(matches, deletables, mark)
 }
 
-func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *Item[T]) bool {
+func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *Item[T], mark func(*Item[T])) bool {
 	b.RLock()
 	bucket, exists := b.buckets[primary]
 	b.RUnlock()
@@ -107,6 +108,9 @@ func (b *layeredBucket[T]) deleteAll(primary string, deletables chan *Item[T]) b
 	}
 	for key, item := range bucket.lookup {
 		delete(bucket.lookup, key)
+		if mark != nil {
+			mark(item)
+		}
 		deletables <- item
 	}
 	return true

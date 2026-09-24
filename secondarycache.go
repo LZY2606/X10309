@@ -3,8 +3,9 @@ package ccache
 import "time"
 
 type SecondaryCache[T any] struct {
-	bucket *bucket[T]
-	pCache *LayeredCache[T]
+	bucket  *bucket[T]
+	primary string
+	pCache  *LayeredCache[T]
 }
 
 // Get the secondary key.
@@ -17,8 +18,12 @@ func (s *SecondaryCache[T]) Get(secondary string) *Item[T] {
 // The semantics are the same as for LayeredCache.Set
 func (s *SecondaryCache[T]) Set(secondary string, value T, duration time.Duration) *Item[T] {
 	item, existing := s.bucket.set(secondary, value, duration, false)
+	item.group = s.primary
 	if existing != nil {
-		s.pCache.deletables <- existing
+		s.pCache.markForDeletion(existing, ReasonOverwritten)
+		s.pCache.emitSet(item, ReasonReplaced)
+	} else {
+		s.pCache.emitSet(item, ReasonCreated)
 	}
 	s.pCache.promote(item)
 	return item
@@ -43,7 +48,8 @@ func (s *SecondaryCache[T]) Fetch(secondary string, duration time.Duration, fetc
 func (s *SecondaryCache[T]) Delete(secondary string) bool {
 	item := s.bucket.remove(secondary)
 	if item != nil {
-		s.pCache.deletables <- item
+		item.group = s.primary
+		s.pCache.markForDeletion(item, ReasonDeleted)
 		return true
 	}
 	return false

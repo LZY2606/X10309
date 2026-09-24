@@ -20,6 +20,9 @@ type TrackedItem[T any] interface {
 }
 
 type Item[T any] struct {
+	gen        int64
+	termSent   int32
+	termReason int32
 	key        string
 	group      string
 	promotions int32
@@ -56,6 +59,40 @@ func newItem[T any](key string, value T, expires int64, track bool) *Item[T] {
 func (i *Item[T]) shouldPromote(getsPerPromote int32) bool {
 	i.promotions += 1
 	return i.promotions == getsPerPromote
+}
+
+// Generation returns the per-key generation assigned when the item entered the
+// cache. It starts at 1 for a key and increases on every successful Set of that
+// key, which lets an event sink correlate transitions to a specific value
+// generation without ever observing the value itself.
+func (i *Item[T]) Generation() int64 {
+	return i.gen
+}
+
+// markTerminal records why an item is leaving the cache. Only the first
+// transition wins: a race between (for example) Delete and LRU eviction
+// produces exactly one terminal event. Returns false if another transition
+// already claimed the item.
+func (i *Item[T]) markTerminal(reason EventReason) bool {
+	return atomic.CompareAndSwapInt32(&i.termReason, 0, int32(reason))
+}
+
+// claimTerminal both records the terminal reason and reserves the right to
+// emit the terminal event. Used when a transition is observed without going
+// through markTerminal (e.g. an item sitting in the deletables queue).
+func (i *Item[T]) claimTerminal(reason EventReason) (EventReason, bool) {
+	if atomic.CompareAndSwapInt32(&i.termReason, 0, int32(reason)) {
+		return reason, true
+	}
+	return EventReason(atomic.LoadInt32(&i.termReason)), false
+}
+
+func (i *Item[T]) isTerminal() bool {
+	return atomic.LoadInt32(&i.termReason) != 0
+}
+
+func (i *Item[T]) terminalReason() EventReason {
+	return EventReason(atomic.LoadInt32(&i.termReason))
 }
 
 func (i *Item[T]) Key() string {

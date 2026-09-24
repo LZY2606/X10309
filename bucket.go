@@ -9,6 +9,11 @@ import (
 type bucket[T any] struct {
 	sync.RWMutex
 	lookup map[string]*Item[T]
+	// genSource assigns per-key generations while the bucket lock is held, so
+	// a published item always carries its final generation. The production
+	// caches wire it to a single shared counter; nil is used by standalone
+	// unit-test buckets.
+	genSource func() int64
 }
 
 func (b *bucket[T]) itemCount() int {
@@ -36,11 +41,19 @@ func (b *bucket[T]) get(key string) *Item[T] {
 }
 
 func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track bool) *Item[T] {
+	item, _ := b.insertIfAbsent(key, value, duration, track)
+	return item
+}
+
+// insertIfAbsent stores a new item only when no item exists for the key. The
+// boolean reports whether a new item (rather than an existing one) was
+// returned.
+func (b *bucket[T]) insertIfAbsent(key string, value T, duration time.Duration, track bool) (*Item[T], bool) {
 	b.RLock()
 	item := b.lookup[key]
 	b.RUnlock()
 	if item != nil {
-		return item
+		return item, false
 	}
 
 	expires := time.Now().Add(duration).UnixNano()
@@ -50,13 +63,15 @@ func (b *bucket[T]) setnx(key string, value T, duration time.Duration, track boo
 	defer b.Unlock()
 
 	// check again under write lock
-	item = b.lookup[key]
-	if item != nil {
-		return item
+	if item = b.lookup[key]; item != nil {
+		return item, false
 	}
 
+	if b.genSource != nil {
+		newItem.gen = b.genSource()
+	}
 	b.lookup[key] = newItem
-	return newItem
+	return newItem, true
 }
 
 func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track bool) (*Item[T], bool) {
@@ -78,7 +93,9 @@ func (b *bucket[T]) setnx2(key string, f func() T, duration time.Duration, track
 
 	expires := time.Now().Add(duration).UnixNano()
 	newItem := newItem(key, f(), expires, track)
-
+	if b.genSource != nil {
+		newItem.gen = b.genSource()
+	}
 	b.lookup[key] = newItem
 	return newItem, false
 }
@@ -88,6 +105,9 @@ func (b *bucket[T]) set(key string, value T, duration time.Duration, track bool)
 	item := newItem(key, value, expires, track)
 	b.Lock()
 	existing := b.lookup[key]
+	if b.genSource != nil {
+		item.gen = b.genSource()
+	}
 	b.lookup[key] = item
 	b.Unlock()
 	return item, existing
@@ -120,13 +140,16 @@ func (b *bucket[T]) delete(key string) {
 // the item from the map. I'm pretty sure this is 100% fine, but it is unique.
 // (We do this so that the write to the channel is under the read lock and not the
 // write lock)
-func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan *Item[T]) int {
+func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, deletables chan *Item[T], mark func(*Item[T])) int {
 	lookup := b.lookup
 	items := make([]*Item[T], 0)
 
 	b.RLock()
 	for key, item := range lookup {
 		if matches(key, item) {
+			if mark != nil {
+				mark(item)
+			}
 			deletables <- item
 			items = append(items, item)
 		}
@@ -146,10 +169,10 @@ func (b *bucket[T]) deleteFunc(matches func(key string, item *Item[T]) bool, del
 	return len(items)
 }
 
-func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T]) int {
+func (b *bucket[T]) deletePrefix(prefix string, deletables chan *Item[T], mark func(*Item[T])) int {
 	return b.deleteFunc(func(key string, item *Item[T]) bool {
 		return strings.HasPrefix(key, prefix)
-	}, deletables)
+	}, deletables, mark)
 }
 
 // we expect the caller to have acquired a write lock

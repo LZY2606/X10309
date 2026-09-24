@@ -9,6 +9,8 @@ type Configuration[T any] struct {
 	getsPerPromote int32
 	tracking       bool
 	onDelete       func(item *Item[T])
+	eventSink      EventSink
+	eventBuffer    int
 }
 
 // Creates a configuration object with sensible defaults
@@ -23,6 +25,7 @@ func Configure[T any]() *Configuration[T] {
 		promoteBuffer:  1024,
 		maxSize:        5000,
 		tracking:       false,
+		eventBuffer:    256,
 	}
 }
 
@@ -102,5 +105,30 @@ func (c *Configuration[T]) Track() *Configuration[T] {
 // cached object that require some kind of tear-down.
 func (c *Configuration[T]) OnDelete(callback func(item *Item[T])) *Configuration[T] {
 	c.onDelete = callback
+	return c
+}
+
+// Events enables an opt-in lifecycle event sink. With no sink configured, no
+// event-related work is performed on any cache path. Events never carry cached
+// values and the sink is invoked on a dedicated goroutine, never while an
+// internal lock is held. If the sink cannot keep up, events are dropped rather
+// than blocking cache operations; use Cache.DroppedEvents to observe this.
+//
+// The sink must be safe to invoke for the lifetime of the cache; it must not
+// block indefinitely. It is legal (and safe) for the sink to call back into
+// the same cache from OnEvent.
+func (c *Configuration[T]) Events(sink EventSink) *Configuration[T] {
+	c.eventSink = sink
+	return c
+}
+
+// EventBuffer sets the capacity of the bounded queue between the cache and the
+// event sink's goroutine. A slow sink that lets this fill up starts dropping
+// events (counted via Cache.DroppedEvents). [256]
+func (c *Configuration[T]) EventBuffer(size uint32) *Configuration[T] {
+	if size == 0 {
+		size = 1
+	}
+	c.eventBuffer = int(size)
 	return c
 }

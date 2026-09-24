@@ -13,10 +13,16 @@ type LayeredCache[T any] struct {
 	list            *List[T]
 	buckets         []*layeredBucket[T]
 	bucketMask      uint32
+	generation      int64
 	size            int64
 	pruneTargetSize int64
 	deletables      chan *Item[T]
 	promotables     chan *Item[T]
+	events          *eventHub
+}
+
+func (c *LayeredCache[T]) nextGeneration() int64 {
+	return atomic.AddInt64(&c.generation, 1)
 }
 
 // Create a new layered cache with the specified configuration.
@@ -42,10 +48,15 @@ func Layered[T any](config *Configuration[T]) *LayeredCache[T] {
 		deletables:      make(chan *Item[T], config.deleteBuffer),
 		promotables:     make(chan *Item[T], config.promoteBuffer),
 		pruneTargetSize: config.maxSize - config.maxSize*int64(config.percentToPrune)/100,
+		events:          &eventHub{},
+	}
+	if config.eventSink != nil {
+		c.events = newEventHub(config.eventSink, config.eventBuffer)
 	}
 	for i := 0; i < config.buckets; i++ {
 		c.buckets[i] = &layeredBucket[T]{
-			buckets: make(map[string]*bucket[T]),
+			buckets:   make(map[string]*bucket[T]),
+			genSource: c.nextGeneration,
 		}
 	}
 	go c.worker()
@@ -102,8 +113,9 @@ func (c *LayeredCache[T]) GetOrCreateSecondaryCache(primary string) *SecondaryCa
 	}
 	primaryBkt.Unlock()
 	return &SecondaryCache[T]{
-		bucket: bkt,
-		pCache: c,
+		bucket:  bkt,
+		primary: primary,
+		pCache:  c,
 	}
 }
 
@@ -162,7 +174,7 @@ func (c *LayeredCache[T]) Fetch(primary, secondary string, duration time.Duratio
 func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 	item := c.bucket(primary).remove(primary, secondary)
 	if item != nil {
-		c.deletables <- item
+		c.markForDeletion(item, ReasonDeleted)
 		return true
 	}
 	return false
@@ -170,23 +182,72 @@ func (c *LayeredCache[T]) Delete(primary, secondary string) bool {
 
 // Deletes all items that share the same primary key
 func (c *LayeredCache[T]) DeleteAll(primary string) bool {
-	return c.bucket(primary).deleteAll(primary, c.deletables)
+	return c.bucket(primary).deleteAll(primary, c.deletables, c.markDeleted)
 }
 
 // Deletes all items that share the same primary key and prefix.
 func (c *LayeredCache[T]) DeletePrefix(primary, prefix string) int {
-	return c.bucket(primary).deletePrefix(primary, prefix, c.deletables)
+	return c.bucket(primary).deletePrefix(primary, prefix, c.deletables, c.markDeleted)
 }
 
 // Deletes all items that share the same primary key and where the matches func evaluates to true.
 func (c *LayeredCache[T]) DeleteFunc(primary string, matches func(key string, item *Item[T]) bool) int {
-	return c.bucket(primary).deleteFunc(primary, matches, c.deletables)
+	return c.bucket(primary).deleteFunc(primary, matches, c.deletables, c.markDeleted)
+}
+
+// DroppedEvents returns how many lifecycle events were discarded because the
+// configured EventSink could not keep up. It is always 0 without an Events
+// sink.
+func (c *LayeredCache[T]) DroppedEvents() int64 {
+	return c.events.droppedEvents()
+}
+
+func (c *LayeredCache[T]) markForDeletion(item *Item[T], reason EventReason) {
+	if item.markTerminal(reason) {
+		c.deletables <- item
+	}
+}
+
+func (c *LayeredCache[T]) markDeleted(item *Item[T]) {
+	item.markTerminal(ReasonDeleted)
+}
+
+func (c *LayeredCache[T]) emitSet(item *Item[T], reason EventReason) {
+	c.events.emit(Event{
+		Type:       EventSet,
+		Reason:     reason,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.gen,
+	})
+}
+
+func (c *LayeredCache[T]) emitLifecycle(item *Item[T], eventType EventType, reason EventReason) {
+	c.events.emit(Event{
+		Type:       eventType,
+		Reason:     reason,
+		Key:        item.key,
+		Group:      item.group,
+		Generation: item.gen,
+	})
+}
+
+func (c *LayeredCache[T]) emitTerminalOnce(item *Item[T], reason EventReason) {
+	if reason == 0 || !atomic.CompareAndSwapInt32(&item.termSent, 0, 1) {
+		return
+	}
+	if eventType, ok := terminalEvent(reason); ok {
+		c.emitLifecycle(item, eventType, reason)
+	}
 }
 
 func (c *LayeredCache[T]) set(primary, secondary string, value T, duration time.Duration, track bool) *Item[T] {
 	item, existing := c.bucket(primary).set(primary, secondary, value, duration, track)
 	if existing != nil {
-		c.deletables <- existing
+		c.markForDeletion(existing, ReasonOverwritten)
+		c.emitSet(item, ReasonReplaced)
+	} else {
+		c.emitSet(item, ReasonCreated)
 	}
 	c.promote(item)
 	return item
@@ -226,7 +287,7 @@ func (c *LayeredCache[T]) worker() {
 
 	promoteItem := func(item *Item[T]) {
 		if c.doPromote(item) && c.size > c.maxSize {
-			dropped += c.gc()
+			dropped += c.gc(ReasonCapacity)
 		}
 	}
 
@@ -248,7 +309,7 @@ func (c *LayeredCache[T]) worker() {
 				c.maxSize = newMaxSize
 				c.pruneTargetSize = newMaxSize - newMaxSize*int64(c.percentToPrune)/100
 				if c.size > c.maxSize {
-					dropped += c.gc()
+					dropped += c.gc(ReasonCapacity)
 				}
 				msg.done <- struct{}{}
 			case controlClear:
@@ -272,7 +333,7 @@ func (c *LayeredCache[T]) worker() {
 			case controlGetSize:
 				msg.res <- c.size
 			case controlGC:
-				dropped += c.gc()
+				dropped += c.gc(ReasonPruned)
 				msg.done <- struct{}{}
 			case controlSyncUpdates:
 				doAllPendingPromotesAndDeletes(c.promotables, promoteItem, c.deletables, c.doDelete)
@@ -287,27 +348,28 @@ drain:
 		case item := <-c.deletables:
 			c.doDelete(item)
 		default:
+			c.events.shutdown()
 			return
 		}
 	}
 }
 
 func (c *LayeredCache[T]) doDelete(item *Item[T]) {
-	if !item.inList {
-		item.promotions = -2
-	} else {
+	reason := item.terminalReason()
+	if item.inList {
 		c.size -= item.size
 		if c.onDelete != nil {
 			c.onDelete(item)
 		}
 		c.list.Remove(item)
-		item.promotions = -2
 	}
+	item.promotions = -2
+	c.emitTerminalOnce(item, reason)
 }
 
 func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 	// deleted before it ever got promoted
-	if item.promotions == -2 {
+	if item.promotions == -2 || item.isTerminal() {
 		return false
 	}
 
@@ -315,16 +377,18 @@ func (c *LayeredCache[T]) doPromote(item *Item[T]) bool {
 		if item.shouldPromote(c.getsPerPromote) {
 			c.list.MoveToFront(item)
 			item.promotions = 0
+			c.emitLifecycle(item, EventPromotion, ReasonAccessed)
 		}
 		return false
 	}
 
 	c.size += item.size
 	c.list.Insert(item)
+	c.emitLifecycle(item, EventPromotion, ReasonInserted)
 	return true
 }
 
-func (c *LayeredCache[T]) gc() int {
+func (c *LayeredCache[T]) gc(reason EventReason) int {
 	dropped := 0
 	item := c.list.Tail
 
@@ -337,6 +401,11 @@ func (c *LayeredCache[T]) gc() int {
 		}
 		prev := item.prev
 		if !c.tracking || atomic.LoadInt32(&item.refCount) == 0 {
+			itemReason := reason
+			if item.Expired() {
+				itemReason = ReasonExpired
+			}
+			actualReason, emit := item.claimTerminal(itemReason)
 
 			c.bucket(item.group).delete(item.group, item.key)
 			itemSize := item.size
@@ -349,6 +418,9 @@ func (c *LayeredCache[T]) gc() int {
 			}
 			dropped += 1
 			item.promotions = -2
+			if emit {
+				c.emitTerminalOnce(item, actualReason)
+			}
 		}
 		item = prev
 	}
